@@ -6,6 +6,7 @@
 # All Rights Reserved.
 #
 # Author: Julien Danjou <julien@danjou.info>
+# Author: Chris Forbes <chrisf@ijw.co.nz>
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -19,44 +20,51 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+from oslo.config import cfg
 from ceilometer.openstack.common import log
 from ceilometer.openstack.common import timeutils
 
 from ceilometer.central import plugin
 from ceilometer import sample
-from ceilometer import nova_client
+from neutronclient.v2_0.client import Client as NeutronClient
 
 
 class FloatingIPPollster(plugin.CentralPollster):
 
     LOG = log.getLogger(__name__ + '.floatingip')
 
-    def _get_floating_ips(self):
-        nv = nova_client.Client()
-        return nv.floating_ip_get_all()
+    def _get_floating_ips(self, manager):
+        ksclient = manager.keystone
+        endpoint = ksclient.service_catalog.url_for(
+            service_type='network',
+            endpoint_type=cfg.CONF.service_credentials.os_endpoint_type)
+        neutron = NeutronClient(
+            endpoint_url=endpoint,
+            token=ksclient.auth_token)
 
-    def _iter_floating_ips(self, cache):
+        return neutron.list_floatingips()['floatingips']
+
+    def _iter_floating_ips(self, manager, cache):
         if 'floating_ips' not in cache:
-            cache['floating_ips'] = list(self._get_floating_ips())
+            cache['floating_ips'] = list(self._get_floating_ips(manager))
         return iter(cache['floating_ips'])
 
     def get_samples(self, manager, cache):
-        for ip in self._iter_floating_ips(cache):
-            self.LOG.info("FLOATING IP USAGE: %s" % ip.ip)
-            # FIXME (flwang) Now Nova API /os-floating-ips can't provide those
-            # attributes were used by Ceilometer, such as project id, host.
-            # In this fix, those attributes usage will be removed temporarily.
-            # And they will be back after fix the Nova bug 1174802.
+        for ip in self._iter_floating_ips(manager, cache):
+            self.LOG.info("FLOATING IP USAGE: %s" % ip)
+            # HACK (chrisf) Since nova has some issues providing all the things
+            # we want here, use the neutron API instead, which has no problem
+            # providing all the allocated floating IPs along with their tenant
+            # info.
             yield sample.Sample(
                 name='ip.floating',
                 type=sample.TYPE_GAUGE,
                 unit='ip',
                 volume=1,
                 user_id=None,
-                project_id=None,
-                resource_id=ip.id,
+                project_id=ip['tenant_id'],
+                resource_id=ip['id'],
                 timestamp=timeutils.utcnow().isoformat(),
                 resource_metadata={
-                    'address': ip.ip,
-                    'pool': ip.pool
+                    'address': ip['floating_ip_address'],
                 })
